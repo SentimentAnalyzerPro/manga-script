@@ -3,17 +3,72 @@ import os
 import json
 import datetime
 import urllib.request
+import urllib.error
+import sqlite3
 
 # ── 页面配置 ────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="AI 漫剧视频提示词生成器",
-    page_icon="🎬",
+    page_title="AI 漫剧提示词优化器",
+    page_icon="✨",
     layout="wide"
 )
 
 # ── DeepSeek API 配置 ────────────────────────────────────────────
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-chat"
+
+# ── 数据库 ───────────────────────────────────────────────────────
+DB_PATH = "history.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            style TEXT,
+            clip_count INTEGER,
+            present_characters TEXT,
+            novel_text TEXT,
+            result TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_history(original, result):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO history (created_at, novel_text, result) VALUES (?, ?, ?)",
+        (datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), original, result)
+    )
+    conn.commit()
+    conn.close()
+
+def load_history():
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        "SELECT id, created_at, novel_text FROM history ORDER BY id DESC LIMIT 50"
+    ).fetchall()
+    conn.close()
+    return rows
+
+def load_history_detail(record_id):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT id, created_at, novel_text, result FROM history WHERE id = ?",
+        (record_id,)
+    ).fetchone()
+    conn.close()
+    return row
+
+def delete_history(record_id):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM history WHERE id = ?", (record_id,))
+    conn.commit()
+    conn.close()
+
+init_db()
 
 # ── 景别衔接规则 ────────────────────────────────────────────────
 SHOT_RULES = """
@@ -56,188 +111,217 @@ def call_deepseek(prompt, api_key):
             "Authorization": f"Bearer {api_key}"
         }
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-        return result["choices"][0]["message"]["content"].strip()
-
-# ── 分析小说 ────────────────────────────────────────────────────
-def analyze_novel(novel_text, style, api_key):
-    prompt = f"""你是一位专业的影视制作人，擅长将文学文本转化为视觉化内容。
-
-请阅读以下小说文本，用 JSON 格式提取关键信息：
-
-【小说文本】
-{novel_text}
-
-输出要求（严格 JSON 格式，不要添加任何其他文字）：
-{{
-  "characters": [
-    {{"name": "角色名", "appearance": "外貌关键词", "personality": "性格标签", "outfit": "服装描述"}}
-  ],
-  "scenes": [
-    {{"location": "地点名", "environment": "环境描述", "time": "时间段"}}
-  ],
-  "story_beats": ["片段1的一句话情节概括", "片段2..."],
-  "overall_mood": "整体情绪基调",
-  "suggested_clips": {{"count": 3, "reason": "理由"}}
-}}
-
-story_beats 的数量请根据故事节奏合理划分，生成 {style} 风格下的分析。"""
-
-    raw = call_deepseek(prompt, api_key)
     try:
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        return json.loads(raw)
-    except Exception:
-        return {"raw_analysis": raw}
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            return result["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        if e.code == 500:
+            raise RuntimeError(f"DeepSeek 服务器内部错误（500），可能是提示词过长或服务繁忙，请稍后重试。\n详情：{body[:300]}")
+        elif e.code == 401:
+            raise RuntimeError("API Key 无效或已过期，请检查后重新输入。")
+        elif e.code == 429:
+            raise RuntimeError("请求频率超限，请稍等片刻后重试。")
+        else:
+            raise RuntimeError(f"API 请求失败（HTTP {e.code}）：{body[:300]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"网络连接失败：{e.reason}，请检查网络后重试。")
 
-# ── 生成视频提示词 ──────────────────────────────────────────────
-def generate_prompts(novel_text, analysis, style, clip_count, api_key):
-    if isinstance(analysis, dict) and "characters" in analysis:
-        chars = analysis["characters"]
-        chars_str = "\n".join(
-            f"  - {c['name']}：{c.get('appearance','')}，{c.get('personality','')}，服装：{c.get('outfit','')}"
-            for c in chars
-        )
-        mood = analysis.get("overall_mood", "未知")
-        beats = analysis.get("story_beats", [])
-        beats_str = "\n".join(f"  {i+1}. {b}" for i, b in enumerate(beats))
-    else:
-        chars_str = "见原文"
-        mood = "见原文"
-        beats_str = "见原文"
-
+# ── 优化提示词 ──────────────────────────────────────────────────
+def optimize_prompts(user_prompts, api_key):
     prompt = f"""你是一位专业的即梦AI视频导演，精通即梦插件的提示词写作规范。
 
 {SHOT_RULES}
 
-【任务】
-将以下小说内容转化为 {clip_count} 个视频片段的提示词，视觉风格为"{style}"。
-所有提示词使用中文。
+【用户的原始提示词】
+{user_prompts}
 
-【原始小说】
-{novel_text}
+【第一步：前期分析（只用于内部推理，不输出到最终结果）】
 
-【小说分析】
-角色信息：
-{chars_str}
+1. 出场人物站位分析
+   - 从提示词中提取所有出场人物
+   - 根据剧情/动作推断每个人物在场景中的初始站位（如：A站左侧、B站右侧、C在门口等）
+   - 每个片段追踪人物是否有移动，没有明确移动的人物站位保持不变
 
-整体情绪基调：{mood}
+2. 景别可见人物推断
+   - 对每个片段，结合景别和人物站位，判断哪些人物会出现在画面中
+   - 中景镜头：根据镜头朝向和站位，画面内所有处于景深范围内的人物都应出现（不只是互动主体）
+   - 近景/特写：聚焦主体，背景人物虚化或不可见
+   - 全景/远景：场景内所有人物均可见
 
-情节节点：
-{beats_str}
+3. 景别衔接合规性检查
+   - 列出每个片段景别，检查相邻片段是否违规
 
-【输出格式 - 每个片段严格按此格式】
+4. 机位角度差检查
+   - 检查相邻片段机位角度差是否≥30°且≤180°
+
+5. 时长合规性检查
+   - 纯动作/过渡：1.5～3秒；有台词：字数×0.3秒（最短2秒最长6秒）；空镜：1～2秒
+
+【第二步：输出结果】
+
+先输出「问题诊断」部分，简要列出每个片段存在的违规点。
+
+然后输出「优化后提示词」，每个片段严格按照以下格式，只输出以下字段，其余分析内容不写入：
 
 ========== 片段 N ==========
-【对应情节】一句话概括
-【景别衔接验证】上一片段景别 → 本片段景别（合规说明）
-
-【镜头】景别 + 运镜方式，时长 X 秒（≤3秒）
+【镜头】景别 + 运镜方式，时长 X.X 秒
 【机位】角度描述（与上镜头角度差≥30°）
-
 【画面提示词】
-（镜头动态+主体动作+场景环境+光影风格，具体描述物理细节）
-
-【起始状态】片段开始时的状态
-【结束状态】片段结束时的状态
-
+镜头动态+所有出现在画面中的人物（含非互动人物）的具体动作姿态+场景环境+光影风格，全部用物理细节描述，禁止抽象词
 【情绪节奏】情绪 / 节奏
-【台词】有则写，无则写"无"
-【音效提示】环境音、动作音
-
+【台词】有则写具体内容并注明预计时长，无则写"无"
 【负向提示】模糊、画面变形、人体结构异常、手指扭曲、低画质、水印、文字
 ==============================
 
-注意：
-1. 每个片段时长 ≤3 秒
-2. 相邻片段景别必须隔一级
-3. 机位角度差 ≥30° 且 ≤180°
-4. 只描述具体视觉元素，禁止抽象词
-5. 现在请生成 {clip_count} 个片段，风格为"{style}"
+严格注意：
+1. 每个片段只输出上述6个字段，不输出其他任何字段
+2. 景别违规时必须调整使其合规
+3. 【画面提示词】中，中景镜头必须包含站位在镜头范围内的所有人物，不能只写互动主体
+4. 人物没有明确移动时，站位与上一片段保持一致，体现在【画面提示词】的位置描述中
+5. 禁止出现"充满活力""气氛紧张""令人窒息"等抽象词，改为具体动作/表情/环境描述
+6. 【时长严格规定】用户原始提示词中已标注的时长必须原样保留，不得修改；只有在原始提示词完全没有写时长时，才按规则自动计算
+7. 【台词严格规定】用户原始提示词中的台词内容必须原样保留，一字不改；只补充台词预计时长标注（如果缺少的话）
 """
     return call_deepseek(prompt, api_key)
 
 # ── 主界面 ──────────────────────────────────────────────────────
-st.title("🎬 AI 漫剧视频提示词生成器")
-st.caption("专为即梦插件优化 · 严格遵守景别衔接规则")
+st.title("✨ AI 漫剧提示词优化器")
+st.caption("检查并修正景别衔接、机位角度、时长计算等规则违规")
 
 st.divider()
 
-# 左右两栏布局
-col_left, col_right = st.columns([1, 1])
+tab_optimize, tab_history = st.tabs(["✍️ 优化提示词", "📋 历史记录"])
 
-with col_left:
-    st.subheader("输入设置")
+# ════════════════════════════════════════════════════════════════
+# Tab 1：优化提示词
+# ════════════════════════════════════════════════════════════════
+with tab_optimize:
+    col_left, col_right = st.columns([1, 1])
 
-    # API Key 输入（部署到云上时用这里输入，本地也可以用环境变量）
-    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
-    if not api_key:
-        api_key = st.text_input(
-            "DeepSeek API Key",
-            type="password",
-            placeholder="sk-xxxxxxxx",
-            help="输入你的 DeepSeek API Key，不会被保存"
-        )
+    with col_left:
+        st.subheader("输入")
 
-    novel_text = st.text_area(
-        "粘贴小说文本",
-        height=250,
-        placeholder="在这里粘贴你的小说内容，支持几十字到几千字..."
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        style = st.selectbox(
-            "视觉风格",
-            ["现代都市", "中国古风", "赛博朋克", "奇幻", "民国", "悬疑惊悚"]
-        )
-    with col2:
-        auto_count = max(3, min(12, len(novel_text) // 250)) if novel_text else 5
-        clip_count = st.slider("片段数量", min_value=3, max_value=12, value=auto_count)
-
-    generate_btn = st.button("🚀 生成提示词", type="primary", use_container_width=True)
-
-with col_right:
-    st.subheader("生成结果")
-
-    if generate_btn:
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "")
         if not api_key:
-            st.error("请先输入 DeepSeek API Key")
-        elif not novel_text.strip():
-            st.error("请先输入小说文本")
-        else:
-            with st.spinner("第一步：正在分析小说内容..."):
-                analysis = analyze_novel(novel_text, style, api_key)
-
-            with st.spinner("第二步：正在生成视频提示词..."):
-                result = generate_prompts(novel_text, analysis, style, clip_count, api_key)
-
-            st.success("生成完毕！")
-
-            # 显示结果
-            st.text_area("提示词内容（可直接复制）", value=result, height=500)
-
-            # 下载按钮
-            now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button(
-                label="📥 下载 TXT 文件",
-                data=result.encode("utf-8"),
-                file_name=f"video_prompts_{now}.txt",
-                mime="text/plain",
-                use_container_width=True
+            api_key = st.text_input(
+                "DeepSeek API Key",
+                type="password",
+                placeholder="sk-xxxxxxxx",
+                help="输入你的 DeepSeek API Key，不会被保存"
             )
+
+        user_prompts = st.text_area(
+            "粘贴你的提示词",
+            height=450,
+            placeholder="把你已经写好的分镜提示词粘贴到这里，AI 会检查景别衔接、机位角度、时长等规则并给出优化版本..."
+        )
+
+        optimize_btn = st.button("🚀 开始优化", type="primary", use_container_width=True)
+
+        st.divider()
+        with st.expander("📋 查看景别衔接规则"):
+            st.markdown(SHOT_RULES)
+
+    with col_right:
+        st.subheader("优化结果")
+
+        if optimize_btn:
+            if not api_key:
+                st.error("请先输入 DeepSeek API Key")
+            elif not user_prompts.strip():
+                st.error("请先粘贴你的提示词")
+            else:
+                try:
+                    with st.spinner("正在检查规则并优化..."):
+                        result = optimize_prompts(user_prompts, api_key)
+
+                    save_history(user_prompts, result)
+                    st.success("优化完毕！已自动保存到历史记录")
+
+                    st.text_area("优化后的提示词（可直接复制）", value=result, height=500)
+
+                    now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    st.download_button(
+                        label="📥 下载 TXT 文件",
+                        data=result.encode("utf-8"),
+                        file_name=f"optimized_prompts_{now}.txt",
+                        mime="text/plain",
+                        use_container_width=True
+                    )
+                except RuntimeError as e:
+                    st.error(str(e))
+        else:
+            st.info("粘贴提示词后点击「开始优化」")
+            st.markdown("""
+**优化内容包括：**
+1. 分析所有出场人物的初始站位，未明确移动时保持不变
+2. 检测景别衔接违规并修正
+3. 检查机位角度差（≥30°且≤180°）
+4. 精确计算每个片段时长
+5. 中景镜头补全所有站位在画面内的人物，而不只是互动主体
+6. 将抽象描述改为具体视觉细节
+7. 补全负向提示
+
+**输出字段：**
+【镜头】【机位】【画面提示词】【情绪节奏】【台词】【负向提示】
+            """)
+
+# ════════════════════════════════════════════════════════════════
+# Tab 2：历史记录
+# ════════════════════════════════════════════════════════════════
+with tab_history:
+    st.subheader("历史记录")
+
+    rows = load_history()
+
+    if not rows:
+        st.info("还没有历史记录，优化后会自动保存在这里")
     else:
-        st.info("填写左侧信息后，点击「生成提示词」按钮")
-        st.markdown("""
-**使用说明：**
-1. 粘贴小说文本
-2. 选择视觉风格和片段数量
-3. 点击生成
-4. 将【画面提示词】复制到即梦插件
-5. 将【负向提示】复制到即梦负向输入框
-6. 【起始/结束状态】配合即梦首尾帧功能使用
-        """)
+        if "view_id" not in st.session_state:
+            st.session_state.view_id = None
+
+        if st.session_state.view_id is not None:
+            detail = load_history_detail(st.session_state.view_id)
+            if detail:
+                record_id, created_at, original, result = detail
+                st.markdown(f"### 记录 #{record_id} · {created_at}")
+
+                if st.button("← 返回列表"):
+                    st.session_state.view_id = None
+                    st.rerun()
+
+                st.divider()
+                col_orig, col_opt = st.columns(2)
+                with col_orig:
+                    st.markdown("**原始提示词**")
+                    st.text_area("", value=original, height=400, key="orig_detail")
+                with col_opt:
+                    st.markdown("**优化后提示词**")
+                    st.text_area("", value=result, height=400, key="opt_detail")
+
+                st.download_button(
+                    label="📥 下载优化结果",
+                    data=result.encode("utf-8"),
+                    file_name=f"optimized_prompts_{created_at.replace(':', '-').replace(' ', '_')}.txt",
+                    mime="text/plain"
+                )
+        else:
+            for row in rows:
+                record_id, created_at, original = row
+                preview = original[:50] + "..." if len(original) > 50 else original
+
+                col_info, col_btn, col_del = st.columns([6, 1, 1])
+                with col_info:
+                    st.markdown(f"**#{record_id}** · {created_at}  \n_{preview}_")
+                with col_btn:
+                    if st.button("查看", key=f"view_{record_id}"):
+                        st.session_state.view_id = record_id
+                        st.rerun()
+                with col_del:
+                    if st.button("删除", key=f"del_{record_id}"):
+                        delete_history(record_id)
+                        st.rerun()
+
+                st.divider()
